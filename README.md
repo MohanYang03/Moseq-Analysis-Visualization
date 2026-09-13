@@ -28,7 +28,7 @@ Group names in the CSVs should follow `{treatment}_{timepoint}_{sex}`, for examp
    - load stats and labels
    - build per-mouse usage / entropy tables
    - build group mean / SEM tables
-   - run the `plot_syllable_usage_diff` cells to save EPS figures under `figures/`
+   - run the `plot_syllable_usage_diff` cells to save figures under `figures/eps/` and `figures/png/`
 
 5. Optional sections:
    - transition matrices expects `{group}_bigram_transition_matrix.csv` under `DATA_DIR`

@@ -42,6 +42,8 @@ class ExperimentConfig:
     stats_csv: Optional[str] = None
     moseq_csv: Optional[str] = None
     figures_dir: str = 'figures'
+    figures_eps_dir: Optional[str] = None
+    figures_png_dir: Optional[str] = None
     fingerprint_plot_dir: Optional[str] = None
     transition_matrix_dir: Optional[str] = None
     transition_matrix_suffix: str = '_bigram_transition_matrix.csv'
@@ -76,8 +78,12 @@ class ExperimentConfig:
             self.stats_csv = join(self.data_dir, 'stats_df.csv')
         if self.moseq_csv is None:
             self.moseq_csv = join(self.data_dir, 'moseq_df.csv')
+        if self.figures_eps_dir is None:
+            self.figures_eps_dir = join(self.figures_dir, 'eps')
+        if self.figures_png_dir is None:
+            self.figures_png_dir = join(self.figures_dir, 'png')
         if self.fingerprint_plot_dir is None:
-            self.fingerprint_plot_dir = join(self.data_dir, 'plots')
+            self.fingerprint_plot_dir = self.figures_dir
         if self.transition_matrix_dir is None:
             self.transition_matrix_dir = self.data_dir
 
@@ -89,6 +95,8 @@ class ExperimentConfig:
         }
 
         os.makedirs(self.figures_dir, exist_ok=True)
+        os.makedirs(self.figures_eps_dir, exist_ok=True)
+        os.makedirs(self.figures_png_dir, exist_ok=True)
         os.makedirs(self.fingerprint_plot_dir, exist_ok=True)
 
     def group_name(self, treatment: str, timepoint: str, sex_code: str) -> str:

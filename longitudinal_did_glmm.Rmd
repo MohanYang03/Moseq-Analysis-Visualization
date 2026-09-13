@@ -1,0 +1,748 @@
+---
+title: "Longitudinal Difference-in-Differences Syllable Usage Analysis"
+author: "MoSeq Analysis"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    theme: flatly
+params:
+  data_dir: "data/final_model_kappa_40000000"
+  counts_csv: "data/syllable_counts_did.csv"
+  rebuild_counts: false
+  python_bin: "/opt/miniconda3/envs/moseq2-app/bin/python"
+  labels_xlsx: "data/Mo-seq syllable behavior labeling.xlsx"
+  labels_sheet: "Copy of Kaitlyn + Steve (KH)"
+  baseline_timepoint: "b2"
+  post_timepoints: ["wk1", "wk2", "wk3", "washout"]
+  max_syllable_id: 54
+  fdr_method: "BH"
+  min_total_counts: 1
+  # Drop visually unstable contrasts from figures (still kept in CSV)
+  max_abs_effect_plot: 8
+  max_se_plot: 3
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 9,
+  fig.height = 5
+)
+```
+
+# Objective
+
+Fit a **syllable-specific beta-binomial GLMM** to mouse-level syllable usage and estimate:
+
+1. Sex-specific difference-in-differences (DiD) for CORT vs VEH relative to baseline
+2. The three-way difference (DDD) testing whether DiD differs by sex
+
+This implements the longitudinal DiD / DDD formulation with mouse random intercepts.
+
+# Model
+
+For each syllable $s$, mouse $i$, and timepoint $t$:
+
+$$
+Y_{ist} \sim \mathrm{BetaBinomial}(N_{it}, p_{ist}, \phi_s)
+$$
+
+$$
+\begin{aligned}
+\mathrm{logit}(p_{ist})
+&= \beta_{0s}
++ \beta_{Ts} T_i
++ \beta_{Ss} S_i
++ \sum_{j=1}^{J} \beta_{js} I_{jt} \\
+&\quad
++ \sum_{j=1}^{J} \beta_{Tj,s}(T_i I_{jt})
++ \beta_{TS,s}(T_i S_i)
++ \sum_{j=1}^{J} \beta_{jS,s}(I_{jt} S_i) \\
+&\quad
++ \sum_{j=1}^{J} \beta_{TjS,s}(T_i I_{jt} S_i)
++ b_{is}
+\end{aligned}
+$$
+
+$$
+b_{is} \sim \mathcal{N}(0, \sigma_{b,s}^2)
+$$
+
+Coding:
+
+- $Y_{ist}$: onset count of syllable $s$ for mouse $i$ at time $t$
+- $N_{it}$: total syllable onsets for that session
+- $T_i = 1$ for CORT, $0$ for VEH
+- $S_i = 1$ for male, $0$ for female
+- $I_{jt}$: indicators for post-baseline timepoints; baseline (`r params$baseline_timepoint`) is the reference
+
+Contrasts (female = reference sex):
+
+$$
+\mathrm{DiD}_{\mathrm{Female},j}^{(s)} = \beta_{Tj,s}
+$$
+
+$$
+\mathrm{DiD}_{\mathrm{Male},j}^{(s)} = \beta_{Tj,s} + \beta_{TjS,s}
+$$
+
+$$
+\mathrm{DDD}_{j}^{(s)} = \beta_{TjS,s}
+$$
+
+# Setup
+
+```{r packages}
+library(tidyverse)
+library(glmmTMB)
+library(readxl)
+```
+
+```{r paths}
+repo_root <- if (requireNamespace("rprojroot", quietly = TRUE)) {
+  tryCatch(
+    rprojroot::find_root(rprojroot::is_git_root),
+    error = function(e) normalizePath(".", winslash = "/", mustWork = TRUE)
+  )
+} else {
+  normalizePath(".", winslash = "/", mustWork = TRUE)
+}
+
+data_dir <- if (grepl("^(/|[A-Za-z]:)", params$data_dir)) {
+  params$data_dir
+} else {
+  file.path(repo_root, params$data_dir)
+}
+counts_csv <- if (grepl("^(/|[A-Za-z]:)", params$counts_csv)) {
+  params$counts_csv
+} else {
+  file.path(repo_root, params$counts_csv)
+}
+labels_xlsx <- if (grepl("^(/|[A-Za-z]:)", params$labels_xlsx)) {
+  params$labels_xlsx
+} else {
+  file.path(repo_root, params$labels_xlsx)
+}
+if (!file.exists(labels_xlsx)) {
+  stop("Syllable labels file not found: ", labels_xlsx)
+}
+if (!dir.exists(data_dir)) {
+  stop("data_dir not found: ", data_dir)
+}
+prep_script <- file.path(repo_root, "scripts", "prepare_syllable_counts_did.py")
+
+baseline <- params$baseline_timepoint
+post_tps <- unlist(params$post_timepoints)
+time_levels <- c(baseline, post_tps)
+
+cat("data_dir: ", data_dir, "\n", sep = "")
+cat("counts_csv: ", counts_csv, "\n", sep = "")
+cat("labels_xlsx: ", labels_xlsx, "\n", sep = "")
+cat("timepoints: ", paste(time_levels, collapse = ", "), "\n", sep = "")
+```
+
+# 1. Data preparation from `moseq_df.csv`
+
+`moseq_df.csv` is frame-level MoSeq output (wiki: one row per frame). For this model we need session-level counts:
+
+- Keep frames with `onset == TRUE` and `labels (usage sort) >= 0` (drop the AR-HMM init label `-5`)
+- $Y_{ist}$: number of onsets of syllable $s$ in the session
+- $N_{it}$: total onsets in the session
+- Mouse ID: `SubjectName`, with batch-labeled names recovered from `SessionName`
+- Design factors parsed from `group` names of the form `{treatment}_{timepoint}_{sex}`
+
+Exclude groups containing `ket` or `sal` so the comparison is CORT vs VEH over the longitudinal time course.
+
+```{r rebuild-counts}
+if (isTRUE(params$rebuild_counts) || !file.exists(counts_csv)) {
+  if (!file.exists(prep_script)) {
+    stop("Missing prep script: ", prep_script)
+  }
+  dir.create(dirname(counts_csv), recursive = TRUE, showWarnings = FALSE)
+  cmd <- sprintf(
+    '"%s" "%s" --data-dir "%s" --out "%s" --timepoints %s',
+    params$python_bin,
+    prep_script,
+    data_dir,
+    counts_csv,
+    paste(time_levels, collapse = " ")
+  )
+  cat("Running:\n", cmd, "\n", sep = "")
+  status <- system(cmd)
+  if (!identical(as.integer(status), 0L)) {
+    stop("Count preparation failed with status ", status)
+  }
+} else {
+  cat("Using existing counts file.\n")
+}
+```
+
+# 2. Load analysis table and check design
+
+```{r load-counts}
+raw <- read_csv(counts_csv, show_col_types = FALSE)
+
+did_df <- raw %>%
+  mutate(
+    treatment = factor(treatment, levels = c("veh", "cort")),
+    sex = factor(sex, levels = c("f", "m")),
+    timepoint = factor(timepoint, levels = time_levels),
+    mouse_id = factor(mouse_id),
+    syllable = as.integer(syllable)
+  ) %>%
+  filter(
+    !is.na(timepoint),
+    N >= params$min_total_counts,
+    is.na(params$max_syllable_id) | syllable <= params$max_syllable_id
+  )
+
+dup_mouse_time <- did_df %>%
+  distinct(mouse_id, timepoint, uuid) %>%
+  count(mouse_id, timepoint) %>%
+  filter(n > 1)
+if (nrow(dup_mouse_time) > 0) {
+  stop("Duplicate mouse_id x timepoint sessions present")
+}
+
+session_n <- did_df %>%
+  distinct(uuid, mouse_id, treatment, sex, timepoint, group, N)
+
+cat("Sessions:", nrow(session_n), "\n")
+cat("Mice:", n_distinct(session_n$mouse_id), "\n")
+cat("Syllables:", n_distinct(did_df$syllable), "\n")
+```
+
+```{r design-table}
+session_n %>%
+  count(treatment, sex, timepoint, name = "n_sessions") %>%
+  pivot_wider(names_from = timepoint, values_from = n_sessions, values_fill = 0) %>%
+  knitr::kable(caption = "Sessions per treatment × sex × timepoint")
+```
+
+```{r completeness}
+session_n %>%
+  count(mouse_id, name = "n_timepoints") %>%
+  count(n_timepoints, name = "n_mice") %>%
+  knitr::kable(caption = "Longitudinal completeness (timepoints observed per mouse)")
+```
+
+Usage reconstructed from onset counts should match MoSeq `stats_df` usage (same definition). Optional check if `stats_df.csv` is present:
+
+```{r usage-check}
+stats_path <- file.path(data_dir, "stats_df.csv")
+if (file.exists(stats_path)) {
+  stats_df <- read_csv(stats_path, show_col_types = FALSE) %>%
+    select(uuid, syllable, usage_stats = usage)
+  cmp <- did_df %>%
+    select(uuid, syllable, usage_counts = usage) %>%
+    inner_join(stats_df, by = c("uuid", "syllable")) %>%
+    mutate(abs_diff = abs(usage_counts - usage_stats))
+  cat(
+    "Median |usage_counts - usage_stats| = ",
+    format(median(cmp$abs_diff), digits = 3),
+    "; max = ",
+    format(max(cmp$abs_diff), digits = 3),
+    "\n",
+    sep = ""
+  )
+} else {
+  cat("stats_df.csv not found; skipping usage cross-check.\n")
+}
+```
+
+# 3. Fit syllable-specific beta-binomial GLMMs
+
+Model formula (R):
+
+```r
+cbind(y, N - y) ~ treatment * timepoint * sex + (1 | mouse_id)
+```
+
+with `family = betabinomial()`. Female / VEH / baseline are reference levels, so coefficient names map directly to the DiD / DDD contrasts above.
+
+```{r fit-helpers}
+extract_effects <- function(fit, syllable_id, post_tps) {
+  b <- fixef(fit)$cond
+  V <- vcov(fit)$cond
+  se <- sqrt(diag(V))
+
+  rows <- lapply(post_tps, function(tp) {
+    fem_nm <- paste0("treatmentcort:timepoint", tp)
+    ddd_nm <- paste0("treatmentcort:timepoint", tp, ":sexm")
+    if (!all(c(fem_nm, ddd_nm) %in% names(b))) {
+      return(NULL)
+    }
+
+    did_f <- unname(b[fem_nm])
+    did_f_se <- unname(se[fem_nm])
+    ddd <- unname(b[ddd_nm])
+    ddd_se <- unname(se[ddd_nm])
+    did_m <- did_f + ddd
+    did_m_se <- sqrt(did_f_se^2 + ddd_se^2 + 2 * V[fem_nm, ddd_nm])
+
+    sigma_b <- tryCatch(
+      unname(attr(VarCorr(fit)$cond$mouse_id, "stddev")),
+      error = function(e) NA_real_
+    )
+
+    tibble(
+      syllable = syllable_id,
+      timepoint = tp,
+      DiD_Female = did_f,
+      DiD_Female_SE = did_f_se,
+      DiD_Female_z = did_f / did_f_se,
+      DiD_Female_p = 2 * pnorm(-abs(did_f / did_f_se)),
+      DiD_Male = did_m,
+      DiD_Male_SE = did_m_se,
+      DiD_Male_z = did_m / did_m_se,
+      DiD_Male_p = 2 * pnorm(-abs(did_m / did_m_se)),
+      DDD = ddd,
+      DDD_SE = ddd_se,
+      DDD_z = ddd / ddd_se,
+      DDD_p = 2 * pnorm(-abs(ddd / ddd_se)),
+      sigma_b = sigma_b,
+      AIC = AIC(fit),
+      converged = isTRUE(fit$fit$convergence == 0)
+    )
+  })
+  bind_rows(rows)
+}
+
+fit_syllable <- function(dat, syllable_id, post_tps) {
+  sdat <- dat %>% filter(syllable == syllable_id)
+  # Skip syllables never observed
+  if (sum(sdat$y) == 0) {
+    return(list(effects = NULL, error = "all-zero counts"))
+  }
+  fit <- tryCatch(
+    glmmTMB(
+      cbind(y, N - y) ~ treatment * timepoint * sex + (1 | mouse_id),
+      data = sdat,
+      family = betabinomial()
+    ),
+    error = function(e) e
+  )
+  if (inherits(fit, "error")) {
+    return(list(effects = NULL, error = conditionMessage(fit)))
+  }
+  list(effects = extract_effects(fit, syllable_id, post_tps), error = NULL, fit = fit)
+}
+```
+
+```{r fit-all, cache=TRUE}
+syllables <- sort(unique(did_df$syllable))
+fit_log <- tibble(syllable = integer(), status = character(), detail = character())
+effects_list <- list()
+
+for (s in syllables) {
+  res <- fit_syllable(did_df, s, post_tps)
+  if (is.null(res$effects)) {
+    fit_log <- add_row(
+      fit_log,
+      syllable = s,
+      status = "failed",
+      detail = if (is.null(res$error)) "unknown" else res$error
+    )
+  } else {
+    effects_list[[as.character(s)]] <- res$effects
+    fit_log <- add_row(
+      fit_log,
+      syllable = s,
+      status = if (all(res$effects$converged)) "ok" else "converged_flag",
+      detail = NA_character_
+    )
+  }
+}
+
+effects <- bind_rows(effects_list)
+cat("Fitted syllables:", n_distinct(effects$syllable), "/", length(syllables), "\n")
+fit_log %>% count(status) %>% knitr::kable(caption = "Model fit status by syllable")
+```
+
+# 4. Multiple-testing adjustment
+
+FDR is applied separately within each contrast family across syllables × post-baseline timepoints.
+Rows with non-finite standard errors (typically singular / non-converged fits) are retained in the
+output file but excluded from FDR adjustment and from the primary significance tables.
+
+```{r fdr}
+effects <- effects %>%
+  mutate(
+    estimable = is.finite(DiD_Female_SE) & is.finite(DiD_Male_SE) & is.finite(DDD_SE) &
+      converged %in% TRUE,
+    DiD_Female_q = NA_real_,
+    DiD_Male_q = NA_real_,
+    DDD_q = NA_real_
+  )
+
+idx <- which(effects$estimable)
+effects$DiD_Female_q[idx] <- p.adjust(effects$DiD_Female_p[idx], method = params$fdr_method)
+effects$DiD_Male_q[idx] <- p.adjust(effects$DiD_Male_p[idx], method = params$fdr_method)
+effects$DDD_q[idx] <- p.adjust(effects$DDD_p[idx], method = params$fdr_method)
+
+out_dir <- file.path(repo_root, "figures")
+eps_dir <- file.path(out_dir, "eps")
+png_dir <- file.path(out_dir, "png")
+dir.create(eps_dir, showWarnings = FALSE, recursive = TRUE)
+dir.create(png_dir, showWarnings = FALSE, recursive = TRUE)
+
+save_plot_eps_png <- function(plot, stem, width, height, dpi = 300) {
+  stem <- sub("\\.(eps|png|pdf)$", "", basename(stem), ignore.case = TRUE)
+  eps_path <- file.path(eps_dir, paste0(stem, ".eps"))
+  png_path <- file.path(png_dir, paste0(stem, ".png"))
+  ggsave(eps_path, plot, width = width, height = height, device = "eps")
+  ggsave(png_path, plot, width = width, height = height, dpi = dpi)
+  cat("Saved: ", eps_path, "\n", sep = "")
+  cat("Saved: ", png_path, "\n", sep = "")
+  invisible(c(eps = eps_path, png = png_path))
+}
+
+effects_path <- file.path(repo_root, "data", "did_ddd_effects.csv")
+write_csv(effects, effects_path)
+cat("Wrote ", effects_path, "\n", sep = "")
+cat("Estimable contrasts: ", sum(effects$estimable), "/", nrow(effects), "\n", sep = "")
+cat("Figures (EPS): ", eps_dir, "\n", sep = "")
+cat("Figures (PNG): ", png_dir, "\n", sep = "")
+```
+
+# 5. Results
+
+Effects are on the **logit (log-odds) scale**. Positive DiD means CORT increased syllable usage relative to VEH more than at baseline (for that sex). Positive DDD means the male DiD exceeds the female DiD.
+
+For figures, keep `estimable` contrasts and further drop extreme / high-SE estimates that distort the axis. Exact values stay in `did_ddd_effects.csv` and the tables below.
+
+```{r load-categories}
+cat_levels <- c("locomotion", "exploratory", "grooming", "immobility", "hesitation")
+
+syllable_cats <- readxl::read_excel(
+  labels_xlsx,
+  sheet = params$labels_sheet,
+  skip = 1
+) %>%
+  transmute(
+    syllable = as.integer(`syllable short id`),
+    category = str_to_lower(str_trim(`general category`))
+  ) %>%
+  filter(!is.na(syllable), category %in% cat_levels) %>%
+  distinct(syllable, .keep_all = TRUE)
+
+effects <- effects %>%
+  left_join(syllable_cats, by = "syllable") %>%
+  mutate(
+    category = factor(category, levels = cat_levels),
+    timepoint = factor(timepoint, levels = post_tps)
+  )
+
+plot_df <- effects %>%
+  filter(
+    estimable,
+    !is.na(category),
+    abs(DDD) <= params$max_abs_effect_plot,
+    abs(DiD_Female) <= params$max_abs_effect_plot,
+    abs(DiD_Male) <= params$max_abs_effect_plot,
+    DDD_SE <= params$max_se_plot,
+    DiD_Female_SE <= params$max_se_plot,
+    DiD_Male_SE <= params$max_se_plot
+  )
+
+cat(
+  "Plotting ", nrow(plot_df), " / ", sum(effects$estimable),
+  " estimable contrasts after stability filters.\n",
+  sep = ""
+)
+```
+
+```{r summary-counts}
+effects %>%
+  filter(estimable) %>%
+  summarise(
+    n_tests = n(),
+    DiD_Female_p05 = sum(DiD_Female_p < 0.05, na.rm = TRUE),
+    DiD_Female_q05 = sum(DiD_Female_q < 0.05, na.rm = TRUE),
+    DiD_Male_p05 = sum(DiD_Male_p < 0.05, na.rm = TRUE),
+    DiD_Male_q05 = sum(DiD_Male_q < 0.05, na.rm = TRUE),
+    DDD_p05 = sum(DDD_p < 0.05, na.rm = TRUE),
+    DDD_q05 = sum(DDD_q < 0.05, na.rm = TRUE)
+  ) %>%
+  knitr::kable(caption = "Significant estimable tests at raw p < 0.05 and FDR q < 0.05")
+```
+
+## Main figure: sex-specific DiD by category
+
+Show **both sexes**. DDD alone does not say whether CORT changed usage in females, males, or both.
+
+```{r did-category-plot, fig.width=12, fig.height=8}
+did_long <- plot_df %>%
+  select(
+    syllable, category, timepoint,
+    Female = DiD_Female, Male = DiD_Male,
+    Female_SE = DiD_Female_SE, Male_SE = DiD_Male_SE,
+    Female_q = DiD_Female_q, Male_q = DiD_Male_q
+  ) %>%
+  pivot_longer(
+    cols = c(Female, Male),
+    names_to = "sex",
+    values_to = "DiD"
+  ) %>%
+  mutate(
+    SE = if_else(sex == "Female", Female_SE, Male_SE),
+    q = if_else(sex == "Female", Female_q, Male_q),
+    syllable = factor(syllable, levels = sort(unique(syllable)))
+  )
+
+p_did <- ggplot(
+  did_long,
+  aes(
+    x = syllable,
+    y = DiD,
+    ymin = DiD - 1.96 * SE,
+    ymax = DiD + 1.96 * SE,
+    color = sex,
+    shape = q < 0.05,
+    group = sex
+  )
+) +
+  geom_hline(yintercept = 0, linewidth = 0.4, color = "grey40") +
+  geom_pointrange(position = position_dodge(width = 0.7), size = 0.15, fatten = 1.4) +
+  facet_grid(category ~ timepoint, scales = "free_x", space = "free_x") +
+  scale_color_manual(values = c(Female = "#CC79A7", Male = "#0072B2"), name = "Sex") +
+  scale_shape_manual(values = c(`FALSE` = 1, `TRUE` = 16), name = "FDR q < 0.05") +
+  labs(
+    x = "Syllable ID",
+    y = "DiD (logit)",
+    title = "Sex-specific CORT vs VEH DiD by syllable category",
+    subtitle = "Estimate ± 1.96 SE; filled = FDR q < 0.05"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 6),
+    strip.background = element_rect(fill = "grey95", color = NA),
+    panel.grid.minor = element_blank()
+  )
+
+print(p_did)
+save_plot_eps_png(p_did, "did_by_category", width = 12, height = 8)
+```
+
+```{r did-category-time-plot, eval=FALSE}
+# Optional denser alternative kept for exploration; main figure is above.
+```
+
+## DDD by category (one plot per category)
+
+```{r ddd-category-plots, fig.width=6.5, fig.height=7}
+ddd_theme <- theme_bw(base_size = 11) +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1, size = 8),
+    strip.background = element_rect(fill = "grey95", color = NA),
+    panel.grid.minor = element_blank()
+  )
+
+for (cat in cat_levels) {
+  ddd_cat <- plot_df %>%
+    filter(category == cat) %>%
+    mutate(syllable = factor(syllable, levels = sort(unique(syllable))))
+
+  if (nrow(ddd_cat) == 0) {
+    cat("No plottable DDD rows for ", cat, "\n", sep = "")
+    next
+  }
+
+  n_syll <- n_distinct(ddd_cat$syllable)
+  fig_w <- max(5.5, 0.35 * n_syll + 2.5)
+  fig_h <- 7
+
+  p_ddd <- ggplot(
+    ddd_cat,
+    aes(
+      x = syllable,
+      y = DDD,
+      ymin = DDD - 1.96 * DDD_SE,
+      ymax = DDD + 1.96 * DDD_SE,
+      color = DDD_q < 0.05
+    )
+  ) +
+    geom_hline(yintercept = 0, linewidth = 0.5, color = "grey40") +
+    geom_pointrange(size = 0.25, fatten = 1.5) +
+    facet_grid(timepoint ~ ., switch = "y") +
+    scale_color_manual(
+      values = c(`FALSE` = "grey60", `TRUE` = "#0072B2"),
+      name = "FDR q < 0.05"
+    ) +
+    labs(
+      x = "Syllable ID",
+      y = "DDD (logit)",
+      title = paste0("DDD: ", str_to_title(cat), " syllables"),
+      subtitle = "Male DiD − Female DiD; estimate ± 1.96 SE"
+    ) +
+    ddd_theme
+
+  print(p_ddd)
+  save_plot_eps_png(p_ddd, paste0("ddd_", cat), width = fig_w, height = fig_h)
+}
+```
+
+## Heatmap summary (one plot per category)
+
+Color = estimate, asterisk = FDR q < 0.05. Shared color scale across categories for comparability.
+
+```{r heatmap-by-category, fig.width=7.5, fig.height=4.5}
+heat_df <- plot_df %>%
+  select(
+    syllable, category, timepoint, DiD_Female, DiD_Male, DDD,
+    DiD_Female_q, DiD_Male_q, DDD_q
+  ) %>%
+  pivot_longer(
+    cols = c(DiD_Female, DiD_Male, DDD),
+    names_to = "contrast",
+    values_to = "estimate"
+  ) %>%
+  mutate(
+    q = case_when(
+      contrast == "DiD_Female" ~ DiD_Female_q,
+      contrast == "DiD_Male" ~ DiD_Male_q,
+      TRUE ~ DDD_q
+    ),
+    contrast = factor(contrast, levels = c("DiD_Female", "DiD_Male", "DDD")),
+    sig = q < 0.05
+  )
+
+lim <- max(abs(heat_df$estimate), na.rm = TRUE)
+
+for (cat in cat_levels) {
+  heat_cat <- heat_df %>%
+    filter(category == cat) %>%
+    mutate(syllable = factor(syllable, levels = sort(unique(syllable))))
+
+  if (nrow(heat_cat) == 0) {
+    cat("No plottable heatmap rows for ", cat, "\n", sep = "")
+    next
+  }
+
+  # Height scales lightly with number of syllables in the category
+  n_syll <- n_distinct(heat_cat$syllable)
+  fig_h <- max(3.2, 0.28 * n_syll + 1.8)
+
+  p_heat <- ggplot(heat_cat, aes(x = timepoint, y = syllable, fill = estimate)) +
+    geom_tile(color = "white", linewidth = 0.2) +
+    geom_text(aes(label = if_else(sig, "*", "")), size = 3.2, vjust = 0.75) +
+    facet_wrap(~contrast, nrow = 1) +
+    scale_fill_gradient2(
+      low = "#2166AC", mid = "white", high = "#B2182B",
+      midpoint = 0, limits = c(-lim, lim), name = "logit"
+    ) +
+    labs(
+      x = "Timepoint",
+      y = "Syllable ID",
+      title = paste0("DiD / DDD heatmap: ", str_to_title(cat), " syllables"),
+      subtitle = "* FDR q < 0.05"
+    ) +
+    theme_bw(base_size = 11) +
+    theme(
+      panel.grid = element_blank(),
+      strip.background = element_rect(fill = "grey95", color = NA)
+    )
+
+  print(p_heat)
+  save_plot_eps_png(p_heat, paste0("heatmap_", cat), width = 7.5, height = fig_h)
+}
+```
+
+## Tables of exact DiD / DDD values
+
+Yes — report the numeric estimates. Main text/figure for pattern; table/supplement for values.
+
+```{r ddd-table}
+effects %>%
+  filter(estimable, !is.na(category)) %>%
+  arrange(DDD_q, DDD_p) %>%
+  select(syllable, category, timepoint, DDD, DDD_SE, DDD_z, DDD_p, DDD_q) %>%
+  head(30) %>%
+  knitr::kable(
+    digits = 3,
+    caption = "Top DDD effects (male DiD − female DiD), sorted by FDR q"
+  )
+```
+
+```{r did-tables}
+effects %>%
+  filter(estimable, !is.na(category), DiD_Female_q < 0.05) %>%
+  arrange(category, timepoint, DiD_Female_q) %>%
+  select(syllable, category, timepoint, DiD_Female, DiD_Female_SE, DiD_Female_p, DiD_Female_q) %>%
+  knitr::kable(digits = 3, caption = "Female DiD with FDR q < 0.05")
+
+effects %>%
+  filter(estimable, !is.na(category), DiD_Male_q < 0.05) %>%
+  arrange(category, timepoint, DiD_Male_q) %>%
+  select(syllable, category, timepoint, DiD_Male, DiD_Male_SE, DiD_Male_p, DiD_Male_q) %>%
+  knitr::kable(digits = 3, caption = "Male DiD with FDR q < 0.05")
+```
+
+# 6. Interpretation notes
+
+- Estimates are conditional on the mouse random intercept and use a logit link, so they are log-odds contrasts, not raw usage differences.
+- $\mathrm{DiD}_{\mathrm{Female},j}$ is the treatment-by-time interaction for females.
+- $\mathrm{DDD}_j$ tests whether that longitudinal CORT effect differs in males.
+- Sessions with malformed batch `SubjectName` values were remapped to animal IDs from `SessionName` before fitting.
+- Rare syllables can yield unstable fits; figures exclude high-SE / extreme estimates, while the CSV retains all fits.
+- For a paper: main figure = category-faceted DiD (both sexes) + DDD; supplement = full `did_ddd_effects.csv` and heatmap.
+- All plots are written to `figures/eps/` and `figures/png/`.
+
+# 7. Diagnose syllables 15 and 16
+
+These two syllables often have non-finite DiD SEs (`estimable = FALSE`). The block below prints cell-level sparsity, optimizer status, Hessian positive-definiteness, and the full `glmmTMB` summary.
+
+```{r diagnose-15-16}
+diagnose_syllable <- function(s) {
+  sdat <- did_df %>%
+    filter(syllable == s)
+
+  cell_counts <- sdat %>%
+    group_by(treatment, sex, timepoint) %>%
+    summarise(
+      n_sessions = n(),
+      total_y = sum(y),
+      total_N = sum(N),
+      pooled_usage = total_y / total_N,
+      zero_sessions = sum(y == 0),
+      all_zero = all(y == 0),
+      .groups = "drop"
+    )
+
+  fit <- glmmTMB(
+    cbind(y, N - y) ~
+      treatment * timepoint * sex +
+      (1 | mouse_id),
+    data = sdat,
+    family = betabinomial()
+  )
+
+  cat("\n===== Syllable ", s, " =====\n", sep = "")
+  print(cell_counts)
+  cat("\nOptimizer code:", fit$fit$convergence, "\n")
+  cat("Optimizer message:", fit$fit$message, "\n")
+  cat("Positive-definite Hessian:", fit$sdr$pdHess, "\n\n")
+
+  print(summary(fit))
+
+  if ("diagnose" %in% getNamespaceExports("glmmTMB")) {
+    glmmTMB::diagnose(fit)
+  }
+
+  invisible(fit)
+}
+
+fit15 <- diagnose_syllable(15)
+fit16 <- diagnose_syllable(16)
+```
+
+# Session info
+
+```{r session-info}
+sessionInfo()
+```

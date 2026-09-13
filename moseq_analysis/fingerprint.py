@@ -53,8 +53,15 @@ def plotting_fingerprint_colored(
     plot_columns=None,
     col_names=None,
     filename_stem='moseq_fingerprint',
+    eps_dir: Optional[str] = None,
+    png_dir: Optional[str] = None,
+    png_dpi: int = 300,
 ):
-    """Fingerprint heatmap with a custom colored group strip."""
+    """Fingerprint heatmap with a custom colored group strip.
+
+    EPS and PNG are written to ``eps_dir`` / ``png_dir`` when provided;
+    otherwise both formats (plus PDF) are written under ``save_dir``.
+    """
     if level_names is None:
         level_names = ['Group']
     if plot_columns is None:
@@ -147,10 +154,23 @@ def plotting_fingerprint_colored(
     makedirs(save_dir, exist_ok=True)
     plt.rcParams['ps.fonttype'] = 42
     plt.rcParams['pdf.fonttype'] = 42
-    fig.savefig(join(save_dir, f'{filename_stem}.pdf'), bbox_inches='tight')
-    fig.savefig(join(save_dir, f'{filename_stem}.png'), dpi=200, bbox_inches='tight')
-    fig.savefig(join(save_dir, f'{filename_stem}.eps'), format='eps', bbox_inches='tight')
-    print(f'Saved: {join(save_dir, filename_stem)}.pdf / .png / .eps')
+
+    if eps_dir is None and png_dir is None:
+        eps_dir = save_dir
+        png_dir = save_dir
+        fig.savefig(join(save_dir, f'{filename_stem}.pdf'), bbox_inches='tight')
+
+    if eps_dir is not None:
+        makedirs(eps_dir, exist_ok=True)
+        eps_path = join(eps_dir, f'{filename_stem}.eps')
+        fig.savefig(eps_path, format='eps', bbox_inches='tight')
+        print(f'Saved: {eps_path}')
+    if png_dir is not None:
+        makedirs(png_dir, exist_ok=True)
+        png_path = join(png_dir, f'{filename_stem}.png')
+        fig.savefig(png_path, dpi=png_dpi, bbox_inches='tight')
+        print(f'Saved: {png_path}')
+
     plt.show()
     plt.close(fig)
 
@@ -237,5 +257,7 @@ def run_fingerprint_for_treatment(
         group_colors=color_map,
         preprocessor=preprocessor,
         filename_stem=f'moseq_fingerprint_{treatment}_pretty',
+        eps_dir=join(config.figures_eps_dir, 'fingerprint'),
+        png_dir=join(config.figures_png_dir, 'fingerprint'),
     )
     return summary, range_dict
